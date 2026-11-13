@@ -158,18 +158,19 @@ async def get_ai_agent_response(user_id: int, user_message: str) -> str:
     if not api_key:
         return "⚠️ GEMINI_API_KEY topilmadi. Iltimos, .env fayliga API kalitni qo'shing."
 
-    url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key={api_key}"
+    # Yangi model nomi (agar Google boshqa model tavsiya qilsa avtomatik o'tadi)
+    model_name = "gemini-3.0-flash"
 
     history = user_histories.setdefault(user_id, [])
     history.append({"role": "user", "parts": [{"text": user_message}]})
 
-    # Xotira juda uzayib ketmasligi uchun oxirgi 12 ta qadamni saqlaymiz
     if len(history) > 12:
         history[:] = history[-12:]
 
     try:
         async with aiohttp.ClientSession() as session:
-            for _ in range(3):
+            for _ in range(4):
+                url = f"https://generativelanguage.googleapis.com/v1beta/models/{model_name}:generateContent?key={api_key}"
                 payload = {
                     "system_instruction": {"parts": [{"text": SYSTEM_INSTRUCTION}]},
                     "contents": history,
@@ -181,8 +182,15 @@ async def get_ai_agent_response(user_id: int, user_message: str) -> str:
                     data = await resp.json()
 
                 if "error" in data:
+                    err_msg = data["error"].get("message", "Nomalum xato")
+                    # Agar Google xatoda boshqa model nomini ko'rsatsa, avtomatik o'sha modelga ulanadi
+                    import re
+                    match = re.search(r"models/(gemini-[a-zA-Z0-9.-]+)", err_msg)
+                    if match and match.group(1) != model_name:
+                        model_name = match.group(1)
+                        continue
                     history.pop()
-                    return f"⚠️ Gemini API xatosi: {data['error'].get('message', 'Nomalum xato')}"
+                    return f"⚠️ Gemini API xatosi: {err_msg}"
 
                 candidate = data.get("candidates", [{}])[0]
                 model_content = candidate.get("content", {})
@@ -191,16 +199,13 @@ async def get_ai_agent_response(user_id: int, user_message: str) -> str:
                 if not parts:
                     return "🍔 Kechirasiz, javobni shakllantirib bo'lmadi. Qayta yozib ko'ring!"
 
-                # Model javobini xotiraga qo'shamiz
                 history.append(model_content)
 
-                # Model funksiya (Tool) chaqirganini tekshiramiz
                 fn_calls = [p["functionCall"] for p in parts if "functionCall" in p]
                 if not fn_calls:
                     text_parts = [p.get("text", "") for p in parts if "text" in p]
                     return "\n".join(text_parts).strip()
 
-                # Chaqirilgan funksiyalarni bajarib, natijasini Gemini'ga qaytaramiz
                 fn_responses = []
                 for call in fn_calls:
                     fn_name = call["name"]
