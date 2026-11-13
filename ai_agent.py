@@ -2,7 +2,6 @@ import os
 import random
 import aiohttp
 
-# Urban Bites Store menyusi (Mini App bilan bir xil baza)
 MENU_ITEMS = [
     {"id": 1, "name": "Classic Smash Burger", "category": "Burgers", "price": 8.99, "desc": "Double beef patty, cheddar, house sauce"},
     {"id": 2, "name": "Truffle Mushroom Burger", "category": "Burgers", "price": 11.49, "desc": "Swiss cheese, roasted mushrooms, truffle mayo"},
@@ -21,9 +20,6 @@ MENU_ITEMS = [
     {"id": 15, "name": "Warm Chocolate Lava Cake", "category": "Desserts", "price": 6.99, "desc": "Molten chocolate center with vanilla ice cream"},
 ]
 
-# ==========================================
-# 1. AI AGENT FUNKSIYALARI (TOOLS)
-# ==========================================
 
 def search_menu_items(category: str = "all", max_price: float = 100.0) -> list[dict]:
     results = []
@@ -73,7 +69,6 @@ def create_chat_order(customer_items: str, total_price: float, delivery_address_
     }
 
 
-# Gemini API uchun Tool (Function Calling) tavsiflari
 TOOLS_DECLARATION = [
     {
         "function_declarations": [
@@ -102,7 +97,7 @@ TOOLS_DECLARATION = [
             },
             {
                 "name": "create_chat_order",
-                "description": "Register and confirm a customer order ONLY after the customer explicitly confirms they want to place the order.",
+                "description": "Register and confirm a customer order after the customer explicitly confirms they want to place the order.",
                 "parameters": {
                     "type": "OBJECT",
                     "properties": {
@@ -125,12 +120,12 @@ RULES:
 1. Reply in the same language the user writes in (English, Uzbek, or Russian).
 2. Use `search_menu_items` to check the menu or filter by budget/category.
 3. Use `calculate_combo_price` to compute exact totals.
-4. Use `create_chat_order` ONLY when the user confirms they want to place the order.
+4. Use `create_chat_order` when the user confirms they want to place the order.
 5. Keep replies concise (3-6 short lines) with clean emojis. Remind them they can also tap the Mini App button below for the visual catalog.
 """
 
-# Foydalanuvchilar suhbat xotirasi
 user_histories = {}
+ACTIVE_MODEL = None
 
 
 def execute_local_tool(fn_name: str, args: dict):
@@ -153,13 +148,54 @@ def execute_local_tool(fn_name: str, args: dict):
     return {"error": f"Unknown function: {fn_name}"}
 
 
+async def detect_available_model(session: aiohttp.ClientSession, api_key: str) -> str:
+    """Google API'dan ushbu kalit uchun ruxsat berilgan ishchi modelni avtomatik topadi."""
+    global ACTIVE_MODEL
+    if ACTIVE_MODEL:
+        return ACTIVE_MODEL
+
+    list_url = f"https://generativelanguage.googleapis.com/v1beta/models?key={api_key}"
+    async with session.get(list_url) as resp:
+        data = await resp.json()
+
+    models = data.get("models", [])
+    available = []
+    for m in models:
+        methods = m.get("supportedGenerationMethods", [])
+        name = m.get("name", "")  # masalan: "models/gemini-3-flash-preview"
+        short_name = name.replace("models/", "")
+        if "generateContent" in methods and "gemini" in short_name:
+            if not any(skip in short_name for skip in ["tts", "image", "embedding", "aqa", "vision"]):
+                available.append(short_name)
+
+    # Eng tez va yangi Flash modellarini birinchi tanlaymiz
+    preferred_order = [
+        "gemini-3-flash",
+        "gemini-3-flash-preview",
+        "gemini-flash-latest",
+        "gemini-2.5-flash-lite",
+        "gemini-2.5-pro",
+        "gemini-3-pro",
+    ]
+    for pref in preferred_order:
+        if pref in available:
+            ACTIVE_MODEL = pref
+            return ACTIVE_MODEL
+
+    for m_name in available:
+        if "flash" in m_name:
+            ACTIVE_MODEL = m_name
+            return ACTIVE_MODEL
+
+    ACTIVE_MODEL = available[0] if available else "gemini-flash-latest"
+    return ACTIVE_MODEL
+
+
 async def get_ai_agent_response(user_id: int, user_message: str) -> str:
+    global ACTIVE_MODEL
     api_key = os.getenv("GEMINI_API_KEY")
     if not api_key:
         return "⚠️ GEMINI_API_KEY topilmadi. Iltimos, .env fayliga API kalitni qo'shing."
-
-    # Yangi model nomi (agar Google boshqa model tavsiya qilsa avtomatik o'tadi)
-    model_name = "gemini-3.0-flash"
 
     history = user_histories.setdefault(user_id, [])
     history.append({"role": "user", "parts": [{"text": user_message}]})
@@ -169,7 +205,9 @@ async def get_ai_agent_response(user_id: int, user_message: str) -> str:
 
     try:
         async with aiohttp.ClientSession() as session:
-            for _ in range(4):
+            model_name = await detect_available_model(session, api_key)
+
+            for _ in range(3):
                 url = f"https://generativelanguage.googleapis.com/v1beta/models/{model_name}:generateContent?key={api_key}"
                 payload = {
                     "system_instruction": {"parts": [{"text": SYSTEM_INSTRUCTION}]},
@@ -182,15 +220,9 @@ async def get_ai_agent_response(user_id: int, user_message: str) -> str:
                     data = await resp.json()
 
                 if "error" in data:
-                    err_msg = data["error"].get("message", "Nomalum xato")
-                    # Agar Google xatoda boshqa model nomini ko'rsatsa, avtomatik o'sha modelga ulanadi
-                    import re
-                    match = re.search(r"models/(gemini-[a-zA-Z0-9.-]+)", err_msg)
-                    if match and match.group(1) != model_name:
-                        model_name = match.group(1)
-                        continue
+                    ACTIVE_MODEL = None
                     history.pop()
-                    return f"⚠️ Gemini API xatosi: {err_msg}"
+                    return f"⚠️ Gemini API xatosi ({model_name}): {data['error'].get('message', 'Nomalum xato')}"
 
                 candidate = data.get("candidates", [{}])[0]
                 model_content = candidate.get("content", {})
