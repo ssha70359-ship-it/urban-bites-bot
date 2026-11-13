@@ -14,6 +14,7 @@ from aiogram.types import (
     InlineKeyboardMarkup,
     InlineKeyboardButton,
 )
+from ai_agent import get_ai_agent_response
 
 load_dotenv()
 
@@ -52,10 +53,10 @@ async def cmd_start(message: Message):
 
     welcome_text = (
         f"👋 <b>Welcome to Urban Bites Store Demo, {message.from_user.first_name}!</b>\n\n"
-        "This is a live portfolio demonstration of a <b>Telegram Mini App (WebApp)</b> "
-        "built with <b>React (Vite) + Python (aiogram 3)</b>.\n\n"
-        "👇 Tap the <b>'🛍 Open Urban Bites Store'</b> button at the bottom of your screen "
-        "to browse products, add items to your cart, and test live order checkout!"
+        "This is a live portfolio demonstration of a <b>Telegram Mini App (WebApp) + AI Sales Agent</b> "
+        "built with <b>React (Vite) + Python (aiogram 3) + Gemini AI</b>.\n\n"
+        "🛍 <b>Option 1 (Visual Store):</b> Tap the <b>'🛍 Open Urban Bites Store'</b> button below to browse products and checkout.\n"
+        "🤖 <b>Option 2 (AI Waiter):</b> Simply write a message right here in the chat (e.g., <i>'What burgers do you have under $12?'</i> or <i>'Suggest a combo for $25'</i>)!"
     )
 
     await message.answer(welcome_text, parse_mode="HTML", reply_markup=reply_kb)
@@ -108,6 +109,24 @@ async def handle_webapp_order(message: Message):
     except Exception as e:
         logging.error(f"Error parsing WebApp data: {e}")
         await message.answer("⚠️ Error processing order data.")
+
+
+@dp.message(F.text & ~F.text.startswith("/"))
+async def ai_waiter_handler(message: Message):
+    await bot.send_chat_action(chat_id=message.chat.id, action="typing")
+    reply_text = await get_ai_agent_response(message.from_user.id, message.text)
+
+    inline_kb = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text="🚀 Launch Mini App Demo",
+                    web_app=WebAppInfo(url=WEBAPP_URL),
+                )
+            ]
+        ]
+    )
+    await message.answer(reply_text, reply_markup=inline_kb)
 
 
 # Render port tekshiruvi uchun mitti veb-server
