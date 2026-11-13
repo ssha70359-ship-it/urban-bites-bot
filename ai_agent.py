@@ -20,6 +20,10 @@ MENU_ITEMS = [
     {"id": 15, "name": "Warm Chocolate Lava Cake", "category": "Desserts", "price": 6.99, "desc": "Molten chocolate center with vanilla ice cream"},
 ]
 
+MENU_TEXT_SUMMARY = "\n".join(
+    [f"- {i['name']} ({i['category']}): ${i['price']} — {i['desc']}" for i in MENU_ITEMS]
+)
+
 
 def search_menu_items(category: str = "all", max_price: float = 100.0) -> list[dict]:
     results = []
@@ -65,7 +69,8 @@ def create_chat_order(customer_items: str, total_price: float, delivery_address_
         "order_id": order_id,
         "items_summary": customer_items,
         "total_usd": f"${float(total_price):.2f}",
-        "note": delivery_address_or_note
+        "note": delivery_address_or_note,
+        "payment_info": "Demo Mode: Payment is simulated via Stripe / Telegram Stars / Cash on Delivery."
     }
 
 
@@ -74,36 +79,36 @@ TOOLS_DECLARATION = [
         "function_declarations": [
             {
                 "name": "search_menu_items",
-                "description": "Search menu items by category (Burgers, Pizza, Sides, Drinks, Desserts, or all) and maximum price in USD.",
+                "description": "Filter menu items by category and maximum price in USD.",
                 "parameters": {
                     "type": "OBJECT",
                     "properties": {
-                        "category": {"type": "STRING", "description": "Category name: Burgers, Pizza, Sides, Drinks, Desserts, or all"},
+                        "category": {"type": "STRING", "description": "Burgers, Pizza, Sides, Drinks, Desserts, or all"},
                         "max_price": {"type": "NUMBER", "description": "Maximum price in USD"}
                     }
                 }
             },
             {
                 "name": "calculate_combo_price",
-                "description": "Calculate exact total price in USD for a list of menu item names and their quantities.",
+                "description": "Calculate exact total price in USD for multiple items.",
                 "parameters": {
                     "type": "OBJECT",
                     "properties": {
-                        "item_names": {"type": "ARRAY", "items": {"type": "STRING"}, "description": "Names of the items"},
-                        "quantities": {"type": "ARRAY", "items": {"type": "INTEGER"}, "description": "Quantity for each item"}
+                        "item_names": {"type": "ARRAY", "items": {"type": "STRING"}},
+                        "quantities": {"type": "ARRAY", "items": {"type": "INTEGER"}}
                     },
                     "required": ["item_names", "quantities"]
                 }
             },
             {
                 "name": "create_chat_order",
-                "description": "Register and confirm a customer order after the customer explicitly confirms they want to place the order.",
+                "description": "Register and confirm a customer order when they confirm or ask to pay/checkout.",
                 "parameters": {
                     "type": "OBJECT",
                     "properties": {
                         "customer_items": {"type": "STRING", "description": "Summary of ordered items and quantities"},
                         "total_price": {"type": "NUMBER", "description": "Total order price in USD"},
-                        "delivery_address_or_note": {"type": "STRING", "description": "Customer address or delivery note"}
+                        "delivery_address_or_note": {"type": "STRING", "description": "Customer address or payment/delivery note"}
                     },
                     "required": ["customer_items", "total_price"]
                 }
@@ -112,20 +117,22 @@ TOOLS_DECLARATION = [
     }
 ]
 
-SYSTEM_INSTRUCTION = """
+SYSTEM_INSTRUCTION = f"""
 You are the official AI Waiter & Sales Agent for "Urban Bites Store" (an interactive Telegram Mini App & Restaurant).
-Your job is to help customers pick food, suggest combos within their budget, calculate exact totals, and register orders in chat.
+
+OFFICIAL MENU:
+{MENU_TEXT_SUMMARY}
 
 RULES:
 1. Reply in the same language the user writes in (English, Uzbek, or Russian).
-2. Use `search_menu_items` to check the menu or filter by budget/category.
-3. Use `calculate_combo_price` to compute exact totals when a user picks items.
-4. Use `create_chat_order` when the user confirms they want to place the order.
-5. Keep replies concise (3-6 short lines) with clean emojis. Do NOT use markdown asterisks (**). Remind them they can also tap the Mini App button below for the visual catalog.
+2. You already know the full menu above — answer simple menu/price questions directly in 1 step without calling a tool unless complex filtering is needed.
+3. When the user confirms an order or asks how/where to pay ("to'lov qayerda", "tasdiqlayman", "checkout"), call `create_chat_order` to generate their official Order ID receipt and explain that in this demo, checkout works right here in chat or visually via the Mini App button below (supports Stripe, Crypto, and Telegram Stars in production).
+4. Keep replies concise (3-6 short lines) with clean emojis. Do NOT use markdown asterisks (**).
 """
 
 user_histories = {}
-ACTIVE_MODEL = None
+AVAILABLE_MODELS = []
+SIMPLE_CACHE = {}
 
 
 def execute_local_tool(fn_name: str, args: dict):
@@ -148,120 +155,137 @@ def execute_local_tool(fn_name: str, args: dict):
     return {"error": f"Unknown function: {fn_name}"}
 
 
-async def detect_available_model(session: aiohttp.ClientSession, api_key: str) -> str:
-    global ACTIVE_MODEL
-    if ACTIVE_MODEL:
-        return ACTIVE_MODEL
+async def get_model_candidates(session: aiohttp.ClientSession, api_key: str) -> list[str]:
+    global AVAILABLE_MODELS
+    if AVAILABLE_MODELS:
+        return AVAILABLE_MODELS
 
     list_url = f"https://generativelanguage.googleapis.com/v1beta/models?key={api_key}"
     async with session.get(list_url) as resp:
         data = await resp.json()
 
-    models = data.get("models", [])
-    available = []
-    for m in models:
+    raw_models = []
+    for m in data.get("models", []):
         methods = m.get("supportedGenerationMethods", [])
-        name = m.get("name", "")
-        short_name = name.replace("models/", "")
+        short_name = m.get("name", "").replace("models/", "")
         if "generateContent" in methods and "gemini" in short_name:
-            if not any(skip in short_name for skip in ["tts", "image", "embedding", "aqa", "vision"]):
-                available.append(short_name)
+            if not any(skip in short_name for skip in ["tts", "image", "embedding", "aqa", "vision", "thinking"]):
+                raw_models.append(short_name)
 
-    preferred_order = [
-        "gemini-3-flash",
-        "gemini-3-flash-preview",
-        "gemini-flash-latest",
+    priority = [
         "gemini-2.5-flash-lite",
+        "gemini-2.5-flash-lite-preview",
+        "gemini-2.0-flash-lite",
+        "gemini-2.0-flash",
+        "gemini-flash-lite-latest",
+        "gemini-flash-latest",
+        "gemini-3-flash-preview",
+        "gemini-3-flash",
         "gemini-2.5-pro",
-        "gemini-3-pro",
     ]
-    for pref in preferred_order:
-        if pref in available:
-            ACTIVE_MODEL = pref
-            return ACTIVE_MODEL
 
-    for m_name in available:
-        if "flash" in m_name:
-            ACTIVE_MODEL = m_name
-            return ACTIVE_MODEL
+    ordered = [p for p in priority if p in raw_models]
+    for r in raw_models:
+        if r not in ordered:
+            ordered.append(r)
 
-    ACTIVE_MODEL = available[0] if available else "gemini-flash-latest"
-    return ACTIVE_MODEL
+    AVAILABLE_MODELS = ordered if ordered else ["gemini-flash-latest", "gemini-3-flash-preview"]
+    return AVAILABLE_MODELS
 
 
 async def get_ai_agent_response(user_id: int, user_message: str) -> str:
-    global ACTIVE_MODEL
     api_key = os.getenv("GEMINI_API_KEY")
     if not api_key:
-        return "⚠️ GEMINI_API_KEY topilmadi. Iltimos, .env fayliga API kalitni qo'shing."
+        return "⚠️ GEMINI_API_KEY topilmadi."
 
-    # Xotirani faqat juft (user -> model) matnlar ko'rinishida saqlaymiz
     history = user_histories.setdefault(user_id, [])
     if len(history) > 10:
         history[:] = history[-10:]
     while history and history[0].get("role") != "user":
         history.pop(0)
 
-    # Joriy so'rov uchun vaqtinchalik ishchi ro'yxat
-    working_contents = list(history) + [
-        {"role": "user", "parts": [{"text": user_message}]}
-    ]
+    # Agar suhbat endi boshlangan bo'lsa va bu savol avval berilgan bo'lsa, keshdan (0 limit sarflab) qaytaramiz
+    norm_key = user_message.strip().lower()
+    if not history and norm_key in SIMPLE_CACHE:
+        cached_reply = SIMPLE_CACHE[norm_key]
+        history.append({"role": "user", "parts": [{"text": user_message}]})
+        history.append({"role": "model", "parts": [{"text": cached_reply}]})
+        return cached_reply
 
     try:
         async with aiohttp.ClientSession() as session:
-            model_name = await detect_available_model(session, api_key)
+            models_to_try = await get_model_candidates(session, api_key)
 
-            for _ in range(5):
-                url = f"https://generativelanguage.googleapis.com/v1beta/models/{model_name}:generateContent?key={api_key}"
-                payload = {
-                    "system_instruction": {"parts": [{"text": SYSTEM_INSTRUCTION}]},
-                    "contents": working_contents,
-                    "tools": TOOLS_DECLARATION,
-                    "generationConfig": {"temperature": 0.3}
-                }
+            for model_name in models_to_try:
+                working_contents = list(history) + [
+                    {"role": "user", "parts": [{"text": user_message}]}
+                ]
+                switch_model = False
 
-                async with session.post(url, json=payload) as resp:
-                    data = await resp.json()
+                for _ in range(4):
+                    url = f"https://generativelanguage.googleapis.com/v1beta/models/{model_name}:generateContent?key={api_key}"
+                    payload = {
+                        "system_instruction": {"parts": [{"text": SYSTEM_INSTRUCTION}]},
+                        "contents": working_contents,
+                        "tools": TOOLS_DECLARATION,
+                        "generationConfig": {"temperature": 0.3}
+                    }
 
-                if "error" in data:
-                    ACTIVE_MODEL = None
-                    return f"⚠️ Gemini API xatosi ({model_name}): {data['error'].get('message', 'Nomalum xato')}"
+                    async with session.post(url, json=payload) as resp:
+                        data = await resp.json()
 
-                candidate = data.get("candidates", [{}])[0]
-                model_content = candidate.get("content", {})
-                parts = model_content.get("parts", [])
+                    if "error" in data:
+                        err_code = data["error"].get("code", 0)
+                        err_msg = data["error"].get("message", "")
+                        if err_code in (429, 404, 503) or "quota" in err_msg.lower() or "not found" in err_msg.lower():
+                            switch_model = True
+                            break
+                        return f"⚠️ Xatolik yuz berdi: {err_msg}"
 
-                if not parts:
-                    return "🍔 Kechirasiz, javobni shakllantirib bo'lmadi. Qayta yozib ko'ring!"
+                    candidate = data.get("candidates", [{}])[0]
+                    model_content = candidate.get("content", {})
+                    parts = model_content.get("parts", [])
 
-                working_contents.append(model_content)
+                    if not parts:
+                        switch_model = True
+                        break
 
-                fn_calls = [p["functionCall"] for p in parts if "functionCall" in p]
-                if not fn_calls:
-                    text_parts = [p.get("text", "") for p in parts if "text" in p]
-                    final_text = "\n".join(text_parts).strip().replace("**", "")
+                    working_contents.append(model_content)
 
-                    # Faqat toza savol-javob matnini uzoq muddatli xotiraga qo'shamiz
-                    history.append({"role": "user", "parts": [{"text": user_message}]})
-                    history.append({"role": "model", "parts": [{"text": final_text}]})
-                    return final_text
+                    fn_calls = [p["functionCall"] for p in parts if "functionCall" in p]
+                    if not fn_calls:
+                        text_parts = [p.get("text", "") for p in parts if "text" in p]
+                        final_text = "\n".join(text_parts).strip().replace("**", "")
 
-                fn_responses = []
-                for call in fn_calls:
-                    fn_name = call["name"]
-                    fn_args = call.get("args", {})
-                    result = execute_local_tool(fn_name, fn_args)
-                    fn_responses.append({
-                        "functionResponse": {
-                            "name": fn_name,
-                            "response": {"result": result}
-                        }
-                    })
+                        if not history and len(SIMPLE_CACHE) < 200:
+                            SIMPLE_CACHE[norm_key] = final_text
 
-                working_contents.append({"role": "user", "parts": fn_responses})
+                        history.append({"role": "user", "parts": [{"text": user_message}]})
+                        history.append({"role": "model", "parts": [{"text": final_text}]})
+                        return final_text
 
-            return "✅ Buyurtma ma'lumotlari qayta ishlandi!"
+                    fn_responses = []
+                    for call in fn_calls:
+                        fn_name = call["name"]
+                        fn_args = call.get("args", {})
+                        result = execute_local_tool(fn_name, fn_args)
+                        fn_responses.append({
+                            "functionResponse": {
+                                "name": fn_name,
+                                "response": {"result": result}
+                            }
+                        })
+
+                    working_contents.append({"role": "user", "parts": fn_responses})
+
+                if not switch_model:
+                    break
+
+            return (
+                "⏳ Hozir AI xizmatida so'rovlar ko'p. "
+                "Iltimos, 20-30 soniyadan so'ng qayta yozing yoki pastdagi Mini App tugmasidan foydalaning! 🚀"
+            )
 
     except Exception as e:
         user_histories.pop(user_id, None)
-        return f"⚠️ AI Agent bilan bog'lanishda xatolik: {e}"
+        return f"⚠️ Bog'lanishda xatolik: {e}"
