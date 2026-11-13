@@ -119,9 +119,9 @@ Your job is to help customers pick food, suggest combos within their budget, cal
 RULES:
 1. Reply in the same language the user writes in (English, Uzbek, or Russian).
 2. Use `search_menu_items` to check the menu or filter by budget/category.
-3. Use `calculate_combo_price` to compute exact totals.
+3. Use `calculate_combo_price` to compute exact totals when a user picks items.
 4. Use `create_chat_order` when the user confirms they want to place the order.
-5. Keep replies concise (3-6 short lines) with clean emojis. Remind them they can also tap the Mini App button below for the visual catalog.
+5. Keep replies concise (3-6 short lines) with clean emojis. Do NOT use markdown asterisks (**). Remind them they can also tap the Mini App button below for the visual catalog.
 """
 
 user_histories = {}
@@ -149,7 +149,6 @@ def execute_local_tool(fn_name: str, args: dict):
 
 
 async def detect_available_model(session: aiohttp.ClientSession, api_key: str) -> str:
-    """Google API'dan ushbu kalit uchun ruxsat berilgan ishchi modelni avtomatik topadi."""
     global ACTIVE_MODEL
     if ACTIVE_MODEL:
         return ACTIVE_MODEL
@@ -162,13 +161,12 @@ async def detect_available_model(session: aiohttp.ClientSession, api_key: str) -
     available = []
     for m in models:
         methods = m.get("supportedGenerationMethods", [])
-        name = m.get("name", "")  # masalan: "models/gemini-3-flash-preview"
+        name = m.get("name", "")
         short_name = name.replace("models/", "")
         if "generateContent" in methods and "gemini" in short_name:
             if not any(skip in short_name for skip in ["tts", "image", "embedding", "aqa", "vision"]):
                 available.append(short_name)
 
-    # Eng tez va yangi Flash modellarini birinchi tanlaymiz
     preferred_order = [
         "gemini-3-flash",
         "gemini-3-flash-preview",
@@ -197,21 +195,27 @@ async def get_ai_agent_response(user_id: int, user_message: str) -> str:
     if not api_key:
         return "⚠️ GEMINI_API_KEY topilmadi. Iltimos, .env fayliga API kalitni qo'shing."
 
+    # Xotirani faqat juft (user -> model) matnlar ko'rinishida saqlaymiz
     history = user_histories.setdefault(user_id, [])
-    history.append({"role": "user", "parts": [{"text": user_message}]})
+    if len(history) > 10:
+        history[:] = history[-10:]
+    while history and history[0].get("role") != "user":
+        history.pop(0)
 
-    if len(history) > 12:
-        history[:] = history[-12:]
+    # Joriy so'rov uchun vaqtinchalik ishchi ro'yxat
+    working_contents = list(history) + [
+        {"role": "user", "parts": [{"text": user_message}]}
+    ]
 
     try:
         async with aiohttp.ClientSession() as session:
             model_name = await detect_available_model(session, api_key)
 
-            for _ in range(3):
+            for _ in range(5):
                 url = f"https://generativelanguage.googleapis.com/v1beta/models/{model_name}:generateContent?key={api_key}"
                 payload = {
                     "system_instruction": {"parts": [{"text": SYSTEM_INSTRUCTION}]},
-                    "contents": history,
+                    "contents": working_contents,
                     "tools": TOOLS_DECLARATION,
                     "generationConfig": {"temperature": 0.3}
                 }
@@ -221,7 +225,6 @@ async def get_ai_agent_response(user_id: int, user_message: str) -> str:
 
                 if "error" in data:
                     ACTIVE_MODEL = None
-                    history.pop()
                     return f"⚠️ Gemini API xatosi ({model_name}): {data['error'].get('message', 'Nomalum xato')}"
 
                 candidate = data.get("candidates", [{}])[0]
@@ -231,12 +234,17 @@ async def get_ai_agent_response(user_id: int, user_message: str) -> str:
                 if not parts:
                     return "🍔 Kechirasiz, javobni shakllantirib bo'lmadi. Qayta yozib ko'ring!"
 
-                history.append(model_content)
+                working_contents.append(model_content)
 
                 fn_calls = [p["functionCall"] for p in parts if "functionCall" in p]
                 if not fn_calls:
                     text_parts = [p.get("text", "") for p in parts if "text" in p]
-                    return "\n".join(text_parts).strip()
+                    final_text = "\n".join(text_parts).strip().replace("**", "")
+
+                    # Faqat toza savol-javob matnini uzoq muddatli xotiraga qo'shamiz
+                    history.append({"role": "user", "parts": [{"text": user_message}]})
+                    history.append({"role": "model", "parts": [{"text": final_text}]})
+                    return final_text
 
                 fn_responses = []
                 for call in fn_calls:
@@ -250,7 +258,7 @@ async def get_ai_agent_response(user_id: int, user_message: str) -> str:
                         }
                     })
 
-                history.append({"role": "user", "parts": fn_responses})
+                working_contents.append({"role": "user", "parts": fn_responses})
 
             return "✅ Buyurtma ma'lumotlari qayta ishlandi!"
 
